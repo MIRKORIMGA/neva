@@ -1,7 +1,6 @@
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
 
 export const PRODUCT_IMAGES_BUCKET = 'neva-products';
-const RUNTIME_CONFIG_KEY = 'neva_supabase_config';
 
 interface RuntimeSupabaseConfig {
   url: string;
@@ -11,25 +10,9 @@ interface RuntimeSupabaseConfig {
 const envUrl = (import.meta.env.VITE_SUPABASE_URL || '').trim();
 const envAnonKey = (import.meta.env.VITE_SUPABASE_ANON_KEY || '').trim();
 
+let runtimeConfig: RuntimeSupabaseConfig | null = null;
 let cachedClient: SupabaseClient | null = null;
 let cachedSignature = '';
-
-function readRuntimeConfig(): RuntimeSupabaseConfig | null {
-  try {
-    const raw = localStorage.getItem(RUNTIME_CONFIG_KEY);
-    if (!raw) return null;
-    const parsed = JSON.parse(raw);
-    if (parsed && typeof parsed.url === 'string' && typeof parsed.anonKey === 'string') {
-      return {
-        url: parsed.url.trim(),
-        anonKey: parsed.anonKey.trim(),
-      };
-    }
-    return null;
-  } catch {
-    return null;
-  }
-}
 
 export function getActiveSupabaseCredentials(): {
   url: string;
@@ -40,9 +23,13 @@ export function getActiveSupabaseCredentials(): {
     return { url: envUrl, anonKey: envAnonKey, source: 'env' };
   }
 
-  const runtime = readRuntimeConfig();
-  if (runtime && runtime.url && runtime.anonKey && !runtime.url.includes('placeholder')) {
-    return { url: runtime.url, anonKey: runtime.anonKey, source: 'runtime' };
+  if (
+    runtimeConfig &&
+    runtimeConfig.url &&
+    runtimeConfig.anonKey &&
+    !runtimeConfig.url.includes('placeholder')
+  ) {
+    return { url: runtimeConfig.url, anonKey: runtimeConfig.anonKey, source: 'runtime' };
   }
 
   return { url: '', anonKey: '', source: 'none' };
@@ -84,24 +71,14 @@ export function saveRuntimeSupabaseConfig(url: string, anonKey: string): boolean
     return false;
   }
 
-  const payload = JSON.stringify({ url: cleanUrl, anonKey: cleanKey });
-  try {
-    localStorage.setItem(RUNTIME_CONFIG_KEY, payload);
-  } catch {
-    try {
-      localStorage.removeItem('neva_v2_products');
-      localStorage.setItem(RUNTIME_CONFIG_KEY, payload);
-    } catch {
-      return false;
-    }
-  }
+  runtimeConfig = { url: cleanUrl, anonKey: cleanKey };
   cachedClient = null;
   cachedSignature = '';
   return true;
 }
 
 export function clearRuntimeSupabaseConfig(): void {
-  localStorage.removeItem(RUNTIME_CONFIG_KEY);
+  runtimeConfig = null;
   cachedClient = null;
   cachedSignature = '';
 }

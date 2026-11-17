@@ -278,34 +278,22 @@ export const AdminDashboard: React.FC = () => {
     setIsUploadingImages(true);
     try {
       const uploadedUrls: string[] = [];
-      let supabaseCount = 0;
-      let fallbackWarning = '';
 
       for (const file of validFiles) {
         const result = await uploadProductImageToStorage(file);
-        uploadedUrls.push(result.url);
-        if (result.storage === 'supabase') {
-          supabaseCount++;
-        } else if (result.warning) {
-          fallbackWarning = result.warning;
+        if (result.ok && result.url) {
+          uploadedUrls.push(result.url);
+        } else {
+          showToast(result.error || `Falha ao enviar "${file.name}" para o Supabase Storage.`, 'error');
         }
       }
 
-      setImagesList((prev) => [...prev, ...uploadedUrls]);
-
-      if (supabaseCount > 0) {
-        showToast(
-          supabaseCount === 1
-            ? 'Imagem carregada para o Supabase Storage!'
-            : `${supabaseCount} imagens carregadas para o Supabase Storage!`
-        );
-      } else if (fallbackWarning) {
-        showToast(`Guardado localmente (${fallbackWarning})`, 'info');
-      } else {
+      if (uploadedUrls.length > 0) {
+        setImagesList((prev) => [...prev, ...uploadedUrls]);
         showToast(
           uploadedUrls.length === 1
-            ? 'Imagem adicionada!'
-            : `${uploadedUrls.length} imagens adicionadas!`
+            ? 'Imagem carregada para o Supabase Storage!'
+            : `${uploadedUrls.length} imagens carregadas para o Supabase Storage!`
         );
       }
     } finally {
@@ -383,8 +371,9 @@ export const AdminDashboard: React.FC = () => {
 
     setIsSavingProduct(true);
     try {
+      let saved = false;
       if (editingProduct) {
-        await updateProduct({
+        saved = await updateProduct({
           ...editingProduct,
           name: name.trim(),
           price: numericPrice,
@@ -399,7 +388,7 @@ export const AdminDashboard: React.FC = () => {
           isNewArrival,
         });
       } else {
-        await addProduct({
+        saved = await addProduct({
           name: name.trim(),
           slug: name.trim().toLowerCase().replace(/\s+/g, '-'),
           price: numericPrice,
@@ -421,7 +410,9 @@ export const AdminDashboard: React.FC = () => {
         });
       }
 
-      setIsProductModalOpen(false);
+      if (saved) {
+        setIsProductModalOpen(false);
+      }
     } finally {
       setIsSavingProduct(false);
     }
@@ -887,15 +878,15 @@ export const AdminDashboard: React.FC = () => {
                       <span>Conectado ({supabaseStatus.url})</span>
                     </>
                   ) : (
-                    <span>Armazenamento Local (Aguardando Credenciais)</span>
+                    <span>Não Conectado (Requer Supabase)</span>
                   )}
                 </p>
                 <p className="text-[11px] text-neutral-500 mt-1">
                   {supabaseStatus.source === 'env'
-                    ? 'Configurado via variáveis de ambiente (.env)'
+                    ? 'Configurado via variáveis de ambiente (VITE_SUPABASE_URL / VITE_SUPABASE_ANON_KEY)'
                     : supabaseStatus.source === 'runtime'
-                    ? 'Configurado via painel administrativo'
-                    : 'Insere as chaves públicas do teu projeto Supabase abaixo.'}
+                    ? 'Conectado nesta sessão. Adiciona as chaves na Vercel para persistir após recarregar.'
+                    : 'A loja opera exclusivamente com Supabase. Insere as credenciais abaixo ou configura na Vercel.'}
                 </p>
               </div>
 
@@ -1128,7 +1119,9 @@ export const AdminDashboard: React.FC = () => {
                     Imagens do Produto ({imagesList.length})
                   </label>
                   <span className="text-[11px] text-neutral-400">
-                    {isSupabaseConnected ? 'Upload direto para Supabase Storage' : 'Carregamento local'}
+                    {isSupabaseConnected
+                      ? 'Supabase Storage (neva-products)'
+                      : 'Requer ligação ao Supabase'}
                   </span>
                 </div>
 
@@ -1160,9 +1153,7 @@ export const AdminDashboard: React.FC = () => {
                     <div className="flex flex-col items-center gap-2 py-2">
                       <Loader2 className="w-6 h-6 text-white animate-spin" />
                       <span className="text-xs font-semibold text-white">
-                        {isSupabaseConnected
-                          ? 'A enviar imagens para o Supabase Storage...'
-                          : 'A processar imagens...'}
+                        A enviar imagens para o Supabase Storage...
                       </span>
                     </div>
                   ) : (

@@ -10,8 +10,14 @@ import {
   createOrderInDb,
   updateOrderStatusInDb,
   updatePaymentStatusInDb,
+  fetchUserFavoritesFromDb,
+  addFavoriteInDb,
+  removeFavoriteInDb,
+  fetchAddressesFromDb,
+  addAddressInDb,
+  deleteAddressInDb,
+  updateProfileInDb,
 } from '../lib/supabaseService';
-import { idbGet, idbSet, safeGetLocalStorage, safeSetLocalStorage } from '../lib/localCache';
 
 interface Toast {
   id: string;
@@ -65,14 +71,14 @@ interface StoreContextType {
   isFavorite: (productId: string) => boolean;
 
   // Order Actions
-  createOrder: (orderData: Omit<Order, 'id' | 'orderNumber' | 'createdAt' | 'orderStatus' | 'paymentStatus'>) => Order;
-  updateOrderStatus: (orderId: string, status: Order['orderStatus']) => void;
-  updatePaymentStatus: (orderId: string, status: Order['paymentStatus']) => void;
+  createOrder: (orderData: Omit<Order, 'id' | 'orderNumber' | 'createdAt' | 'orderStatus' | 'paymentStatus'>) => Promise<Order | null>;
+  updateOrderStatus: (orderId: string, status: Order['orderStatus']) => Promise<void>;
+  updatePaymentStatus: (orderId: string, status: Order['paymentStatus']) => Promise<void>;
 
   // Admin Actions
-  addProduct: (product: Omit<Product, 'id'>) => Promise<void>;
-  updateProduct: (product: Product) => Promise<void>;
-  deleteProduct: (productId: string) => Promise<void>;
+  addProduct: (product: Omit<Product, 'id'>) => Promise<boolean>;
+  updateProduct: (product: Product) => Promise<boolean>;
+  deleteProduct: (productId: string) => Promise<boolean>;
 
   // User Actions
   login: (email: string, role?: 'customer' | 'admin') => void;
@@ -80,9 +86,9 @@ interface StoreContextType {
   registerCustomer: (params: { name: string; email: string; phone: string; password: string }) => Promise<boolean>;
   requestPasswordReset: (email: string) => Promise<boolean>;
   logout: () => void;
-  updateUserProfile: (profile: Partial<UserProfile>) => void;
-  addAddress: (address: Omit<UserAddress, 'id'>) => void;
-  deleteAddress: (id: string) => void;
+  updateUserProfile: (profile: Partial<UserProfile>) => Promise<void>;
+  addAddress: (address: Omit<UserAddress, 'id'>) => Promise<void>;
+  deleteAddress: (id: string) => Promise<void>;
 
   // Notification Toast
   showToast: (message: string, type?: 'success' | 'error' | 'info') => void;
@@ -92,32 +98,12 @@ interface StoreContextType {
 const StoreContext = createContext<StoreContextType | undefined>(undefined);
 
 export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
-  // Load products from localStorage (starts empty with zero simulated products)
-  const [products, setProducts] = useState<Product[]>(() =>
-    safeGetLocalStorage<Product[]>('neva_v2_products', [])
-  );
-
+  const [products, setProducts] = useState<Product[]>([]);
   const [categories] = useState<Category[]>(INITIAL_CATEGORIES);
-
-  // Cart state
-  const [cart, setCart] = useState<CartItem[]>(() =>
-    safeGetLocalStorage<CartItem[]>('neva_v2_cart', [])
-  );
-
-  // Favorites state
-  const [favorites, setFavorites] = useState<string[]>(() =>
-    safeGetLocalStorage<string[]>('neva_v2_favorites', [])
-  );
-
-  // Orders state
-  const [orders, setOrders] = useState<Order[]>(() =>
-    safeGetLocalStorage<Order[]>('neva_v2_orders', [])
-  );
-
-  // User state (starts unauthenticated until real login)
-  const [user, setUser] = useState<UserProfile | null>(() =>
-    safeGetLocalStorage<UserProfile | null>('neva_v2_user', null)
-  );
+  const [cart, setCart] = useState<CartItem[]>([]);
+  const [favorites, setFavorites] = useState<string[]>([]);
+  const [orders, setOrders] = useState<Order[]>([]);
+  const [user, setUser] = useState<UserProfile | null>(null);
 
   // Navigation & Modals
   const [activeCategory, setActiveCategory] = useState<CategoryType>('all');
@@ -141,18 +127,31 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     setToasts((prev) => [...prev, { id, message, type }]);
     setTimeout(() => {
       setToasts((prev) => prev.filter((t) => t.id !== id));
-    }, 3800);
+    }, 4000);
   }, []);
 
   const dismissToast = (id: string) => {
     setToasts((prev) => prev.filter((t) => t.id !== id));
   };
 
-  // Sync with Supabase PostgreSQL
+  const hydrateUserRelations = useCallback(async (userId: string) => {
+    const [dbFavs, dbAddresses] = await Promise.all([
+      fetchUserFavoritesFromDb(userId),
+      fetchAddressesFromDb(userId),
+    ]);
+    setFavorites(dbFavs);
+    setUser((prev) => (prev && prev.id === userId ? { ...prev, addresses: dbAddresses, favorites: dbFavs } : prev));
+  }, []);
+
+  // Sync catalog & orders directly from Supabase PostgreSQL
   const syncWithSupabase = useCallback(async () => {
     const configured = isSupabaseConfigured();
     setIsSupabaseConnected(configured);
-    if (!configured) return;
+    if (!configured) {
+      setProducts([]);
+      setOrders([]);
+      return;
+    }
 
     setIsSyncing(true);
     try {
@@ -163,43 +162,43 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
 
       if (productsRes.data) {
         setProducts(productsRes.data);
+      } else if (productsRes.error) {
+        showToast(`Erro ao carregar produtos do Supabase: ${productsRes.error}`, 'error');
       }
+
       if (ordersRes.data) {
         setOrders(ordersRes.data);
       }
     } finally {
       setIsSyncing(false);
     }
-  }, []);
+  }, [showToast]);
 
-  // Hydrate from IndexedDB if available (supports large image catalogs safely), then sync Supabase
+  // Initial Supabase load & auth state listener
   useEffect(() => {
-    let active = true;
-    (async () => {
-      if (!isSupabaseConfigured()) {
-        const [cachedProducts, cachedOrders] = await Promise.all([
-          idbGet<Product[]>('neva_v2_products'),
-          idbGet<Order[]>('neva_v2_orders'),
-        ]);
-        if (!active) return;
-        if (cachedProducts && cachedProducts.length > 0) {
-          setProducts((prev) => (prev.length === 0 ? cachedProducts : prev));
-        }
-        if (cachedOrders && cachedOrders.length > 0) {
-          setOrders((prev) => (prev.length === 0 ? cachedOrders : prev));
-        }
-      }
-      if (active) {
-        syncWithSupabase();
-      }
-    })();
+    syncWithSupabase();
 
     const client = getSupabaseClient();
-    if (!client) {
-      return () => {
-        active = false;
-      };
-    }
+    if (!client) return;
+
+    client.auth.getSession().then(({ data }) => {
+      const sessionUser = data.session?.user;
+      if (sessionUser) {
+        const meta = sessionUser.user_metadata || {};
+        setUser({
+          id: sessionUser.id,
+          name: meta.full_name || sessionUser.email?.split('@')[0] || 'Cliente NEVA',
+          email: sessionUser.email || '',
+          phone: meta.phone || '+244 ',
+          province: 'Luanda',
+          municipality: 'Talatona',
+          role: meta.role === 'admin' ? 'admin' : 'customer',
+          addresses: [],
+          favorites: [],
+        });
+        hydrateUserRelations(sessionUser.id);
+      }
+    });
 
     const { data: authListener } = client.auth.onAuthStateChange((_event, session) => {
       if (session?.user) {
@@ -218,52 +217,14 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             favorites: prev?.favorites || [],
           };
         });
+        hydrateUserRelations(session.user.id);
       }
     });
 
     return () => {
-      active = false;
       authListener.subscription.unsubscribe();
     };
-  }, [syncWithSupabase]);
-
-  // Sync localStorage + IndexedDB mirrors without throwing QuotaExceededError
-  useEffect(() => {
-    idbSet('neva_v2_products', products);
-    const saved = safeSetLocalStorage('neva_v2_products', products);
-    if (!saved) {
-      try {
-        localStorage.removeItem('neva_v2_products');
-      } catch {
-        // ignore
-      }
-    }
-  }, [products]);
-
-  useEffect(() => {
-    safeSetLocalStorage('neva_v2_cart', cart);
-  }, [cart]);
-
-  useEffect(() => {
-    safeSetLocalStorage('neva_v2_favorites', favorites);
-  }, [favorites]);
-
-  useEffect(() => {
-    idbSet('neva_v2_orders', orders);
-    safeSetLocalStorage('neva_v2_orders', orders);
-  }, [orders]);
-
-  useEffect(() => {
-    if (user) {
-      safeSetLocalStorage('neva_v2_user', user);
-    } else {
-      try {
-        localStorage.removeItem('neva_v2_user');
-      } catch {
-        // ignore
-      }
-    }
-  }, [user]);
+  }, [syncWithSupabase, hydrateUserRelations]);
 
   // Cart operations
   const addToCart = (product: Product, size: string, color: ProductColor, quantity = 1) => {
@@ -329,24 +290,35 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     showToast('Cupom removido.', 'info');
   };
 
-  // Favorites
+  // Favorites (persisted in Supabase when logged in)
   const toggleFavorite = (productId: string) => {
-    setFavorites((prev) => {
-      const exists = prev.includes(productId);
-      if (exists) {
-        showToast('Removido dos favoritos', 'info');
-        return prev.filter((id) => id !== productId);
-      } else {
-        showToast('Adicionado aos teus favoritos ❤️');
-        return [...prev, productId];
+    const exists = favorites.includes(productId);
+    if (exists) {
+      setFavorites((prev) => prev.filter((id) => id !== productId));
+      if (user?.id) {
+        removeFavoriteInDb(user.id, productId);
       }
-    });
+      showToast('Removido dos favoritos', 'info');
+    } else {
+      setFavorites((prev) => [...prev, productId]);
+      if (user?.id) {
+        addFavoriteInDb(user.id, productId);
+      }
+      showToast('Adicionado aos teus favoritos ❤️');
+    }
   };
 
   const isFavorite = (productId: string) => favorites.includes(productId);
 
-  // Orders
-  const createOrder = (orderData: Omit<Order, 'id' | 'orderNumber' | 'createdAt' | 'orderStatus' | 'paymentStatus'>) => {
+  // Orders (strictly Supabase)
+  const createOrder = async (
+    orderData: Omit<Order, 'id' | 'orderNumber' | 'createdAt' | 'orderStatus' | 'paymentStatus'>
+  ): Promise<Order | null> => {
+    if (!isSupabaseConfigured()) {
+      showToast('Supabase não configurado. Não é possível registar encomendas sem ligação à base de dados.', 'error');
+      return null;
+    }
+
     const randomSuffix = Math.floor(1000 + Math.random() * 9000);
     const newOrder: Order = {
       ...orderData,
@@ -356,129 +328,143 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       orderStatus: 'pending',
       paymentStatus: 'pending',
     };
-    setOrders((prev) => [newOrder, ...prev]);
-    clearCart();
 
-    if (isSupabaseConfigured()) {
-      createOrderInDb(newOrder, user?.id).then((res) => {
-        if (!res.ok && res.error) {
-          showToast(`Encomenda guardada localmente (Supabase: ${res.error})`, 'info');
-        }
-      });
+    const res = await createOrderInDb(newOrder, user?.id);
+    if (!res.ok) {
+      showToast(`Erro ao guardar encomenda no Supabase: ${res.error || 'Tenta novamente.'}`, 'error');
+      return null;
     }
 
+    setOrders((prev) => [newOrder, ...prev]);
+    clearCart();
     return newOrder;
   };
 
-  const updateOrderStatus = (orderId: string, status: Order['orderStatus']) => {
+  const updateOrderStatus = async (orderId: string, status: Order['orderStatus']) => {
+    if (!isSupabaseConfigured()) {
+      showToast('Supabase não configurado.', 'error');
+      return;
+    }
+
+    const res = await updateOrderStatusInDb(orderId, status);
+    if (!res.ok) {
+      showToast(`Erro ao atualizar encomenda no Supabase: ${res.error}`, 'error');
+      return;
+    }
+
     setOrders((prev) =>
       prev.map((o) => (o.id === orderId ? { ...o, orderStatus: status } : o))
     );
-    if (isSupabaseConfigured()) {
-      updateOrderStatusInDb(orderId, status);
-    }
     showToast(`Estado da encomenda atualizado para: ${status}`, 'info');
   };
 
-  const updatePaymentStatus = (orderId: string, status: Order['paymentStatus']) => {
+  const updatePaymentStatus = async (orderId: string, status: Order['paymentStatus']) => {
+    if (!isSupabaseConfigured()) {
+      showToast('Supabase não configurado.', 'error');
+      return;
+    }
+
+    const res = await updatePaymentStatusInDb(orderId, status);
+    if (!res.ok) {
+      showToast(`Erro ao atualizar pagamento no Supabase: ${res.error}`, 'error');
+      return;
+    }
+
     setOrders((prev) =>
       prev.map((o) => (o.id === orderId ? { ...o, paymentStatus: status } : o))
     );
-    if (isSupabaseConfigured()) {
-      updatePaymentStatusInDb(orderId, status);
-    }
     showToast(`Estado do pagamento atualizado para: ${status}`, 'info');
   };
 
-  // Admin Product Operations
-  const addProduct = async (productData: Omit<Product, 'id'>) => {
+  // Admin Product Operations (strictly Supabase)
+  const addProduct = async (productData: Omit<Product, 'id'>): Promise<boolean> => {
+    if (!isSupabaseConfigured()) {
+      showToast('Conecta o Supabase primeiro na aba "Supabase & Storage" para publicar produtos.', 'error');
+      return false;
+    }
+
     const newProduct: Product = {
       ...productData,
       id: `neva-prod-${Date.now()}`,
     };
+
+    const res = await upsertProductInDb(newProduct);
+    if (!res.ok) {
+      showToast(`Erro ao publicar produto no Supabase: ${res.error}`, 'error');
+      return false;
+    }
+
     setProducts((prev) => [newProduct, ...prev]);
-
-    if (isSupabaseConfigured()) {
-      const res = await upsertProductInDb(newProduct);
-      if (res.ok) {
-        showToast('Produto publicado no Supabase!');
-      } else {
-        showToast(`Guardado localmente (Supabase: ${res.error})`, 'info');
-      }
-    } else {
-      showToast('Novo produto cadastrado com sucesso!');
-    }
+    showToast('Produto publicado no Supabase!');
+    return true;
   };
 
-  const updateProduct = async (updated: Product) => {
+  const updateProduct = async (updated: Product): Promise<boolean> => {
+    if (!isSupabaseConfigured()) {
+      showToast('Supabase não configurado.', 'error');
+      return false;
+    }
+
+    const res = await upsertProductInDb(updated);
+    if (!res.ok) {
+      showToast(`Erro ao atualizar produto no Supabase: ${res.error}`, 'error');
+      return false;
+    }
+
     setProducts((prev) => prev.map((p) => (p.id === updated.id ? updated : p)));
-
-    if (isSupabaseConfigured()) {
-      const res = await upsertProductInDb(updated);
-      if (res.ok) {
-        showToast('Produto atualizado no Supabase!');
-      } else {
-        showToast(`Atualizado localmente (Supabase: ${res.error})`, 'info');
-      }
-    } else {
-      showToast('Produto atualizado com sucesso!');
-    }
+    showToast('Produto atualizado no Supabase!');
+    return true;
   };
 
-  const deleteProduct = async (productId: string) => {
+  const deleteProduct = async (productId: string): Promise<boolean> => {
+    if (!isSupabaseConfigured()) {
+      showToast('Supabase não configurado.', 'error');
+      return false;
+    }
+
+    const res = await deleteProductFromDb(productId);
+    if (!res.ok) {
+      showToast(`Erro ao remover produto do Supabase: ${res.error}`, 'error');
+      return false;
+    }
+
     setProducts((prev) => prev.filter((p) => p.id !== productId));
-
-    if (isSupabaseConfigured()) {
-      const res = await deleteProductFromDb(productId);
-      if (res.ok) {
-        showToast('Produto removido do Supabase.', 'info');
-      } else {
-        showToast(`Removido localmente (Supabase: ${res.error})`, 'info');
-      }
-    } else {
-      showToast('Produto removido do catálogo.', 'info');
-    }
+    showToast('Produto removido do Supabase.', 'info');
+    return true;
   };
 
-  // User Authentication & Profile
+  // Admin portal access (`nevaadmin7161`) & Supabase Auth
   const login = (email: string, role: 'customer' | 'admin' = 'customer') => {
     const isSpecialAdmin = email.trim() === 'nevaadmin7161' || role === 'admin';
+    if (!isSpecialAdmin) {
+      showToast('Autenticação de cliente requer ligação ao Supabase Auth.', 'error');
+      return;
+    }
     const profile: UserProfile = {
-      id: `usr-${Date.now()}`,
-      name: isSpecialAdmin ? 'Administrador NEVA' : email.split('@')[0],
-      email: isSpecialAdmin ? 'admin@neva.ao' : email,
+      id: `admin-neva`,
+      name: 'Administrador NEVA',
+      email: 'admin@neva.ao',
       phone: '+244 962 716 161',
       province: 'Luanda',
       municipality: 'Talatona',
-      role: isSpecialAdmin ? 'admin' : 'customer',
-      addresses: [
-        {
-          id: `addr-${Date.now()}`,
-          label: 'Principal',
-          name: isSpecialAdmin ? 'Administrador NEVA' : email.split('@')[0],
-          phone: '+244 962 716 161',
-          province: 'Luanda',
-          municipality: 'Talatona',
-          address: 'Luanda, Angola',
-          isDefault: true,
-        },
-      ],
+      role: 'admin',
+      addresses: [],
       favorites: [],
     };
     setUser(profile);
-    showToast(`Bem-vindo, ${profile.name}!`);
+    showToast('Bem-vindo, Administrador NEVA!');
   };
 
   const authenticateWithPassword = async (email: string, password: string): Promise<boolean> => {
     const client = getSupabaseClient();
     if (!client) {
-      login(email, 'customer');
-      return true;
+      showToast('Supabase não configurado. Configura VITE_SUPABASE_URL e VITE_SUPABASE_ANON_KEY.', 'error');
+      return false;
     }
 
     const { data, error } = await client.auth.signInWithPassword({ email, password });
     if (error) {
-      showToast(error.message || 'Erro ao iniciar sessão.', 'error');
+      showToast(error.message || 'Erro ao iniciar sessão no Supabase.', 'error');
       return false;
     }
 
@@ -496,6 +482,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         favorites: [],
       };
       setUser(profile);
+      hydrateUserRelations(data.user.id);
       showToast(`Bem-vindo, ${profile.name}!`);
     }
     return true;
@@ -509,8 +496,8 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
   }): Promise<boolean> => {
     const client = getSupabaseClient();
     if (!client) {
-      login(params.email, 'customer');
-      return true;
+      showToast('Supabase não configurado. Não é possível criar conta sem Supabase.', 'error');
+      return false;
     }
 
     const { data, error } = await client.auth.signUp({
@@ -525,7 +512,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     });
 
     if (error) {
-      showToast(error.message || 'Não foi possível criar a conta.', 'error');
+      showToast(error.message || 'Não foi possível criar a conta no Supabase.', 'error');
       return false;
     }
 
@@ -541,7 +528,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         addresses: [],
         favorites: [],
       });
-      showToast('Conta criada no Supabase! Verifica o teu e-mail se necessário.');
+      showToast('Conta criada no Supabase!');
     }
     return true;
   };
@@ -549,8 +536,8 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
   const requestPasswordReset = async (email: string): Promise<boolean> => {
     const client = getSupabaseClient();
     if (!client) {
-      showToast(`Instruções de recuperação enviadas para ${email}.`);
-      return true;
+      showToast('Supabase não configurado.', 'error');
+      return false;
     }
 
     const { error } = await client.auth.resetPasswordForEmail(email, {
@@ -571,35 +558,44 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       client.auth.signOut().catch(() => {});
     }
     setUser(null);
+    setFavorites([]);
     if (currentTab === 'admin') {
       setCurrentTab('home');
     }
     showToast('Sessão terminada.', 'info');
   };
 
-  const updateUserProfile = (patch: Partial<UserProfile>) => {
+  const updateUserProfile = async (patch: Partial<UserProfile>) => {
     if (!user) return;
+    await updateProfileInDb(user.id, patch);
     setUser({ ...user, ...patch });
-    showToast('Perfil atualizado com sucesso!');
+    showToast('Perfil atualizado no Supabase!');
   };
 
-  const addAddress = (addrData: Omit<UserAddress, 'id'>) => {
+  const addAddress = async (addrData: Omit<UserAddress, 'id'>) => {
     if (!user) return;
-    const newAddress: UserAddress = {
-      ...addrData,
-      id: `addr-${Date.now()}`,
-    };
+    const res = await addAddressInDb(user.id, addrData);
+    if (!res.data) {
+      showToast(res.error || 'Erro ao guardar morada no Supabase.', 'error');
+      return;
+    }
+    const newAddress = res.data;
     const updatedAddresses = addrData.isDefault
       ? user.addresses.map((a) => ({ ...a, isDefault: false })).concat(newAddress)
       : [...user.addresses, newAddress];
     setUser({ ...user, addresses: updatedAddresses });
-    showToast('Endereço adicionado com sucesso!');
+    showToast('Endereço guardado no Supabase!');
   };
 
-  const deleteAddress = (id: string) => {
+  const deleteAddress = async (id: string) => {
     if (!user) return;
+    const res = await deleteAddressInDb(user.id, id);
+    if (!res.ok) {
+      showToast(res.error || 'Erro ao remover morada do Supabase.', 'error');
+      return;
+    }
     setUser({ ...user, addresses: user.addresses.filter((a) => a.id !== id) });
-    showToast('Endereço removido.', 'info');
+    showToast('Endereço removido do Supabase.', 'info');
   };
 
   return (

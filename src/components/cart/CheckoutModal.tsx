@@ -44,7 +44,7 @@ export const CheckoutModal: React.FC = () => {
     setTimeout(() => setCopiedField(null), 2500);
   };
 
-  const handleSubmitOrder = (e: React.FormEvent) => {
+  const handleSubmitOrder = async (e: React.FormEvent) => {
     e.preventDefault();
 
     if (!fullName.trim()) {
@@ -61,9 +61,8 @@ export const CheckoutModal: React.FC = () => {
     }
 
     setIsSubmitting(true);
-
-    setTimeout(() => {
-      const order = createOrder({
+    try {
+      const order = await createOrder({
         customerName: fullName,
         customerEmail: email || 'cliente@neva.ao',
         customerPhone: phone,
@@ -78,10 +77,12 @@ export const CheckoutModal: React.FC = () => {
         notes,
       });
 
-      setCompletedOrder(order);
-      setIsSubmitting(false);
+      if (!order) {
+        return;
+      }
 
-      // Trigger celebration confetti
+      setCompletedOrder(order);
+
       try {
         confetti({
           particleCount: 80,
@@ -89,12 +90,14 @@ export const CheckoutModal: React.FC = () => {
           origin: { y: 0.6 },
           colors: ['#FFFFFF', '#BDBDBD', '#4ADE80', '#F59E0B'],
         });
-      } catch (err) {
+      } catch {
         // ignore if not supported
       }
 
       showToast('Encomenda realizada com sucesso!', 'success');
-    }, 800);
+    } finally {
+      setIsSubmitting(false);
+    }
   };
 
   const handleWhatsAppConfirmation = () => {

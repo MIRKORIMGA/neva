@@ -1,4 +1,4 @@
-import { CategoryType, Order, Product, ProductColor } from '../types';
+import { CategoryType, Order, Product, ProductColor, UserAddress, UserProfile } from '../types';
 import { getSupabaseClient, PRODUCT_IMAGES_BUCKET } from './supabase';
 
 const CATEGORY_LABELS: Record<CategoryType, string> = {
@@ -10,14 +10,17 @@ const CATEGORY_LABELS: Record<CategoryType, string> = {
   calcas: 'Calças',
 };
 
+const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 function mapDbRowToProduct(row: any): Product {
   const category = (row.category_id || 't-shirts') as CategoryType;
-  const parsedColors: ProductColor[] = Array.isArray(row.colors) && row.colors.length > 0
-    ? row.colors
-    : [
-        { name: 'Preto', hex: '#111111' },
-        { name: 'Branco', hex: '#FFFFFF' },
-      ];
+  const parsedColors: ProductColor[] =
+    Array.isArray(row.colors) && row.colors.length > 0
+      ? row.colors
+      : [
+          { name: 'Preto', hex: '#111111' },
+          { name: 'Branco', hex: '#FFFFFF' },
+        ];
 
   return {
     id: String(row.id),
@@ -66,7 +69,7 @@ function mapProductToDbRow(product: Product) {
 
 export async function fetchProductsFromDb(): Promise<{ data: Product[] | null; error?: string }> {
   const client = getSupabaseClient();
-  if (!client) return { data: null };
+  if (!client) return { data: null, error: 'Supabase não configurado' };
 
   const { data, error } = await client
     .from('products')
@@ -107,7 +110,7 @@ export async function deleteProductFromDb(productId: string): Promise<{ ok: bool
 
 export async function fetchOrdersFromDb(): Promise<{ data: Order[] | null; error?: string }> {
   const client = getSupabaseClient();
-  if (!client) return { data: null };
+  if (!client) return { data: null, error: 'Supabase não configurado' };
 
   const { data, error } = await client
     .from('orders')
@@ -169,8 +172,7 @@ export async function createOrderInDb(order: Order, userId?: string): Promise<{ 
   const client = getSupabaseClient();
   if (!client) return { ok: false, error: 'Supabase não configurado' };
 
-  const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-  const validUserId = userId && uuidRegex.test(userId) ? userId : null;
+  const validUserId = userId && UUID_REGEX.test(userId) ? userId : null;
 
   const { error: orderError } = await client.from('orders').insert({
     id: order.id,
@@ -225,7 +227,7 @@ export async function updateOrderStatusInDb(
   orderStatus: Order['orderStatus']
 ): Promise<{ ok: boolean; error?: string }> {
   const client = getSupabaseClient();
-  if (!client) return { ok: false };
+  if (!client) return { ok: false, error: 'Supabase não configurado' };
 
   const { error } = await client
     .from('orders')
@@ -241,7 +243,7 @@ export async function updatePaymentStatusInDb(
   paymentStatus: Order['paymentStatus']
 ): Promise<{ ok: boolean; error?: string }> {
   const client = getSupabaseClient();
-  if (!client) return { ok: false };
+  if (!client) return { ok: false, error: 'Supabase não configurado' };
 
   const { error } = await client
     .from('orders')
@@ -252,122 +254,206 @@ export async function updatePaymentStatusInDb(
   return { ok: true };
 }
 
-function readFileAsDataUrl(file: File): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => {
-      if (typeof reader.result !== 'string') {
-        reject(new Error('Falha ao ler ficheiro de imagem.'));
-        return;
-      }
+export async function fetchUserFavoritesFromDb(userId: string): Promise<string[]> {
+  const client = getSupabaseClient();
+  if (!client || !UUID_REGEX.test(userId)) return [];
 
-      const rawDataUrl = reader.result;
-      // If small enough (< 180KB), keep directly without re-encoding
-      if (file.size <= 180 * 1024) {
-        resolve(rawDataUrl);
-        return;
-      }
+  const { data, error } = await client
+    .from('favorites')
+    .select('product_id')
+    .eq('user_id', userId);
 
-      const img = new Image();
-      img.onload = () => {
-        try {
-          const maxDim = 960;
-          let { width, height } = img;
-          if (width > maxDim || height > maxDim) {
-            if (width >= height) {
-              height = Math.round((height * maxDim) / width);
-              width = maxDim;
-            } else {
-              width = Math.round((width * maxDim) / height);
-              height = maxDim;
-            }
-          }
+  if (error || !data) return [];
+  return data.map((row: any) => String(row.product_id));
+}
 
-          const canvas = document.createElement('canvas');
-          canvas.width = width;
-          canvas.height = height;
-          const ctx = canvas.getContext('2d');
-          if (!ctx) {
-            resolve(rawDataUrl);
-            return;
-          }
-          ctx.drawImage(img, 0, 0, width, height);
-          const outputType = file.type === 'image/png' ? 'image/webp' : 'image/jpeg';
-          const compressed = canvas.toDataURL(outputType, 0.8);
-          resolve(compressed.length < rawDataUrl.length ? compressed : rawDataUrl);
-        } catch {
-          resolve(rawDataUrl);
-        }
-      };
-      img.onerror = () => resolve(rawDataUrl);
-      img.src = rawDataUrl;
-    };
-    reader.onerror = () => reject(new Error('Erro ao ler imagem.'));
-    reader.readAsDataURL(file);
-  });
+export async function addFavoriteInDb(userId: string, productId: string): Promise<{ ok: boolean; error?: string }> {
+  const client = getSupabaseClient();
+  if (!client || !UUID_REGEX.test(userId)) return { ok: false };
+
+  const { error } = await client
+    .from('favorites')
+    .upsert({ user_id: userId, product_id: productId }, { onConflict: 'user_id,product_id' });
+
+  if (error) return { ok: false, error: error.message };
+  return { ok: true };
+}
+
+export async function removeFavoriteInDb(userId: string, productId: string): Promise<{ ok: boolean; error?: string }> {
+  const client = getSupabaseClient();
+  if (!client || !UUID_REGEX.test(userId)) return { ok: false };
+
+  const { error } = await client
+    .from('favorites')
+    .delete()
+    .eq('user_id', userId)
+    .eq('product_id', productId);
+
+  if (error) return { ok: false, error: error.message };
+  return { ok: true };
+}
+
+export async function fetchAddressesFromDb(userId: string): Promise<UserAddress[]> {
+  const client = getSupabaseClient();
+  if (!client || !UUID_REGEX.test(userId)) return [];
+
+  const { data, error } = await client
+    .from('addresses')
+    .select('*')
+    .eq('user_id', userId)
+    .order('created_at', { ascending: false });
+
+  if (error || !data) return [];
+  return data.map((row: any) => ({
+    id: String(row.id),
+    label: String(row.label || 'Casa'),
+    name: String(row.name || ''),
+    phone: String(row.phone || ''),
+    province: String(row.province || 'Luanda'),
+    municipality: String(row.municipality || 'Talatona'),
+    address: String(row.address || ''),
+    isDefault: Boolean(row.is_default),
+  }));
+}
+
+export async function addAddressInDb(
+  userId: string,
+  addr: Omit<UserAddress, 'id'>
+): Promise<{ data: UserAddress | null; error?: string }> {
+  const client = getSupabaseClient();
+  if (!client || !UUID_REGEX.test(userId)) {
+    return { data: null, error: 'Sessão Supabase inválida' };
+  }
+
+  if (addr.isDefault) {
+    await client.from('addresses').update({ is_default: false }).eq('user_id', userId);
+  }
+
+  const { data, error } = await client
+    .from('addresses')
+    .insert({
+      user_id: userId,
+      label: addr.label,
+      name: addr.name,
+      phone: addr.phone,
+      province: addr.province,
+      municipality: addr.municipality,
+      address: addr.address,
+      is_default: addr.isDefault,
+    })
+    .select('*')
+    .single();
+
+  if (error || !data) {
+    return { data: null, error: error?.message || 'Erro ao guardar morada' };
+  }
+
+  return {
+    data: {
+      id: String(data.id),
+      label: String(data.label),
+      name: String(data.name),
+      phone: String(data.phone),
+      province: String(data.province),
+      municipality: String(data.municipality),
+      address: String(data.address),
+      isDefault: Boolean(data.is_default),
+    },
+  };
+}
+
+export async function deleteAddressInDb(userId: string, addressId: string): Promise<{ ok: boolean; error?: string }> {
+  const client = getSupabaseClient();
+  if (!client || !UUID_REGEX.test(userId)) return { ok: false };
+
+  const { error } = await client
+    .from('addresses')
+    .delete()
+    .eq('id', addressId)
+    .eq('user_id', userId);
+
+  if (error) return { ok: false, error: error.message };
+  return { ok: true };
+}
+
+export async function updateProfileInDb(
+  userId: string,
+  patch: Partial<UserProfile>
+): Promise<{ ok: boolean; error?: string }> {
+  const client = getSupabaseClient();
+  if (!client || !UUID_REGEX.test(userId)) return { ok: false };
+
+  const payload: Record<string, any> = { updated_at: new Date().toISOString() };
+  if (patch.name !== undefined) payload.full_name = patch.name;
+  if (patch.phone !== undefined) payload.phone = patch.phone;
+  if (patch.province !== undefined) payload.province = patch.province;
+  if (patch.municipality !== undefined) payload.municipality = patch.municipality;
+
+  const { error } = await client.from('profiles').update(payload).eq('id', userId);
+  if (error) return { ok: false, error: error.message };
+  return { ok: true };
 }
 
 export interface UploadedImageResult {
-  url: string;
-  storage: 'supabase' | 'local';
-  warning?: string;
+  ok: boolean;
+  url?: string;
+  error?: string;
 }
 
 export async function uploadProductImageToStorage(file: File): Promise<UploadedImageResult> {
   const client = getSupabaseClient();
-
-  if (client) {
-    const ext = file.name.split('.').pop()?.toLowerCase() || 'png';
-    const baseName = file.name
-      .replace(/\.[^/.]+$/, '')
-      .toLowerCase()
-      .replace(/[^a-z0-9-_]/g, '-')
-      .slice(0, 40);
-    const filePath = `products/${Date.now()}-${Math.random().toString(36).slice(2, 7)}-${baseName || 'neva'}.${ext}`;
-
-    try {
-      const { error: uploadError } = await client.storage
-        .from(PRODUCT_IMAGES_BUCKET)
-        .upload(filePath, file, {
-          cacheControl: '3600',
-          upsert: true,
-          contentType: file.type || 'image/png',
-        });
-
-      if (!uploadError) {
-        const { data: publicUrlData } = client.storage
-          .from(PRODUCT_IMAGES_BUCKET)
-          .getPublicUrl(filePath);
-
-        if (publicUrlData?.publicUrl) {
-          return {
-            url: publicUrlData.publicUrl,
-            storage: 'supabase',
-          };
-        }
-      }
-
-      const fallbackUrl = await readFileAsDataUrl(file);
-      return {
-        url: fallbackUrl,
-        storage: 'local',
-        warning: uploadError?.message || 'Bucket Storage não encontrado; imagem guardada localmente.',
-      };
-    } catch (err: any) {
-      const fallbackUrl = await readFileAsDataUrl(file);
-      return {
-        url: fallbackUrl,
-        storage: 'local',
-        warning: err?.message || 'Erro no Supabase Storage; imagem guardada localmente.',
-      };
-    }
+  if (!client) {
+    return {
+      ok: false,
+      error: 'Supabase não configurado. Conecta o teu projeto Supabase antes de enviar imagens.',
+    };
   }
 
-  const localUrl = await readFileAsDataUrl(file);
-  return {
-    url: localUrl,
-    storage: 'local',
-  };
+  const ext = file.name.split('.').pop()?.toLowerCase() || 'png';
+  const baseName = file.name
+    .replace(/\.[^/.]+$/, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9-_]/g, '-')
+    .slice(0, 40);
+  const filePath = `products/${Date.now()}-${Math.random().toString(36).slice(2, 7)}-${baseName || 'neva'}.${ext}`;
+
+  try {
+    const { error: uploadError } = await client.storage
+      .from(PRODUCT_IMAGES_BUCKET)
+      .upload(filePath, file, {
+        cacheControl: '3600',
+        upsert: true,
+        contentType: file.type || 'image/png',
+      });
+
+    if (uploadError) {
+      return {
+        ok: false,
+        error: `Erro no Supabase Storage: ${uploadError.message}`,
+      };
+    }
+
+    const { data: publicUrlData } = client.storage
+      .from(PRODUCT_IMAGES_BUCKET)
+      .getPublicUrl(filePath);
+
+    if (!publicUrlData?.publicUrl) {
+      return {
+        ok: false,
+        error: 'Não foi possível gerar o link público da imagem no Supabase Storage.',
+      };
+    }
+
+    return {
+      ok: true,
+      url: publicUrlData.publicUrl,
+    };
+  } catch (err: any) {
+    return {
+      ok: false,
+      error: err?.message || 'Falha ao enviar imagem para o Supabase Storage.',
+    };
+  }
 }
 
 export async function deleteProductImageFromStorage(imageUrl: string): Promise<void> {
